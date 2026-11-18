@@ -1,6 +1,6 @@
 import sqlite3
 from pathlib import Path
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 DB_PATH = Path(__file__).resolve().parent / "tasks.db"
@@ -64,4 +64,31 @@ def get_task(task_id: int):
         ).fetchone()
         if not row:
             return JSONResponse(status_code=404, content={"error": "Task not found"})
+        return row_to_dict(row)
+
+@app.post("/tasks", status_code=201, description="Insert a new task into SQLite.")
+async def create_task(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "Invalid JSON body"})
+
+    if not isinstance(body, dict):
+        return JSONResponse(status_code=400, content={"error": "Request body must be a JSON object"})
+
+    title = body.get("title")
+    if not isinstance(title, str) or not title.strip():
+        return JSONResponse(status_code=400, content={"error": "Title is required and cannot be empty"})
+
+    clean_title = title.strip()
+    with get_db() as conn:
+        cursor = conn.execute(
+            "INSERT INTO tasks (title, done) VALUES (?, ?)",
+            (clean_title, False),
+        )
+        conn.commit()
+        new_id = cursor.lastrowid
+        row = conn.execute(
+            "SELECT id, title, done FROM tasks WHERE id = ?", (new_id,)
+        ).fetchone()
         return row_to_dict(row)
