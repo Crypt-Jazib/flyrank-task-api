@@ -1,6 +1,7 @@
 import sqlite3
 from pathlib import Path
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 
 DB_PATH = Path(__file__).resolve().parent / "tasks.db"
 
@@ -30,6 +31,13 @@ def init_db():
             )
         conn.commit()
 
+def row_to_dict(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"],
+        "title": row["title"],
+        "done": bool(row["done"]),
+    }
+
 init_db()
 
 app = FastAPI(title="Task API", version="2.0", description="CRUD API backed by SQLite.")
@@ -41,3 +49,19 @@ def read_root():
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
+
+@app.get("/tasks", description="List all tasks from SQLite.")
+def get_tasks():
+    with get_db() as conn:
+        rows = conn.execute("SELECT id, title, done FROM tasks").fetchall()
+        return [row_to_dict(row) for row in rows]
+
+@app.get("/tasks/{task_id}", description="Get a single task by ID from SQLite.")
+def get_task(task_id: int):
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT id, title, done FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if not row:
+            return JSONResponse(status_code=404, content={"error": "Task not found"})
+        return row_to_dict(row)
