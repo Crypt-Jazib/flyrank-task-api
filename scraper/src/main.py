@@ -1,20 +1,52 @@
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import re
 import time
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
+from pydantic import BaseModel, Field, ValidationError, field_validator
 import requests
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 CACHE_DIR = BASE_DIR / "cache"
 BOOKS_CACHE_DIR = CACHE_DIR / "books"
+OUTPUT_DIR = BASE_DIR / "output"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 BOOKS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 USER_AGENT = "FlyRankInternship-A9/1.0 (+https://github.com/Crypt-Jazib/flyrank-task-api)"
 REQUEST_TIMEOUT = 10
 REQUEST_DELAY_SECONDS = 0.6
+
+
+class BookRecord(BaseModel):
+    title: str = Field(min_length=1)
+    product_url: str
+    price_text: str = Field(min_length=1)
+    price_gbp: float = Field(ge=0)
+    availability_text: str = Field(min_length=1)
+    rating_text: str = Field(min_length=1)
+    description: str | None = None
+    source_page: str
+    fetched_at: str = Field(min_length=1)
+
+    @field_validator("product_url", "source_page")
+    @classmethod
+    def must_be_https_url(cls, value: str) -> str:
+        if not value.startswith("https://"):
+            raise ValueError("URL must start with https://")
+        return value
+
+
+def parse_price_gbp(price_text: str | None) -> float:
+    if not price_text:
+        raise ValueError("Missing price_text")
+    match = re.search(r"(\d+(?:\.\d+)?)", price_text)
+    if not match:
+        raise ValueError(f"Could not parse numeric price from '{price_text}'")
+    return round(float(match.group(1)), 2)
 
 
 def fetch_page(url: str, cache_path: Path, use_delay: bool = True, quiet: bool = False) -> tuple[str, bool]:
@@ -125,27 +157,42 @@ def extract_book_record(html: str, product_url: str, source_page: str) -> dict:
     }
 
 
+def normalize_and_validate(raw_record: dict) -> BookRecord:
+    candidate = {
+        **raw_record,
+        "price_gbp": parse_price_gbp(raw_record.get("price_text")),
+    }
+    return BookRecord.model_validate(candidate)
+
+
 def main():
     start_url = "https://books.toscrape.com/catalogue/page-1.html"
     book_links = discover_books(start_url, max_pages=3)
 
-    raw_records = []
-    for idx, item in enumerate(book_links, start=1):
+    valid_by_url: dict[str, dict] = {}
+    errors: list[dict] = []
+
+    for item in book_links:
         cache_file = BOOKS_CACHE_DIR / slug_from_book_url(item["product_url"])
-        html, from_cache = fetch_page(
+        html, _ = fetch_page(
             item["product_url"],
             cache_file,
             use_delay=True,
             quiet=True,
         )
-        if not from_cache and idx % 10 == 0:
-            print(f"Fetched {idx}/{len(book_links)} detail pages...")
-        record = extract_book_record(html, item["product_url"], item["source_page"])
-        raw_records.append(record)
+        raw = extract_book_record(html, item["product_url"], item["source_page"])
+        try:
+            validated = normalize_and_validate(raw)
+            valid_by_url[validated.product_url] = validated.model_dump()
+        except (ValidationError, ValueError) as exc:
+            errors.append({"product_url": item["product_url"], "reason": str(exc), "raw": raw})
 
-    print(f"detail_pages={len(raw_records)}")
-    print("Sample raw record:")
-    print(json.dumps(raw_records[0], indent=2, ensure_ascii=False))
+    books_path = OUTPUT_DIR / "books.json"
+    errors_path = OUTPUT_DIR / "errors.json"
+    books_path.write_text(json.dumps(list(valid_by_url.values()), indent=2, ensure_ascii=False), encoding="utf-8")
+    errors_path.write_text(json.dumps(errors, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    print(f"valid_records={len(valid_by_url)}, invalid_records={len(errors)}")
 
 
 if __name__ == "__main__":
