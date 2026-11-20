@@ -1,3 +1,4 @@
+import argparse
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -50,45 +51,70 @@ def parse_price_gbp(price_text: str | None) -> float:
 
 
 def fetch_page(url: str, cache_path: Path, use_delay: bool = True, quiet: bool = False) -> tuple[str, bool]:
-    """Return (html, from_cache)."""
+    """Fetch HTML with cache check, polite delay, and single retry on timeout/5xx only."""
     if cache_path.exists():
         html = cache_path.read_text(encoding="utf-8")
         if not quiet:
             print(f"CACHE HIT | {cache_path.name} ({len(html.encode('utf-8'))} bytes)")
         return html, True
 
-    if use_delay:
-        time.sleep(REQUEST_DELAY_SECONDS)
-
     headers = {"User-Agent": USER_AGENT}
-    response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+    last_error: Exception | None = None
 
-    if response.status_code != 200:
-        raise RuntimeError(f"Failed to fetch {url}: HTTP {response.status_code}")
+    for attempt in range(2):
+        if use_delay or attempt > 0:
+            time.sleep(REQUEST_DELAY_SECONDS * (attempt + 1))
 
-    response.encoding = "utf-8"
-    html = response.text
-    cache_path.write_text(html, encoding="utf-8")
-    if not quiet:
-        print(f"FETCH     | {cache_path.name} ({len(html.encode('utf-8'))} bytes)")
-    return html, False
+        try:
+            response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+        except requests.Timeout as exc:
+            last_error = RuntimeError(f"Timeout fetching {url}: {exc}")
+            continue
+        except requests.RequestException as exc:
+            raise RuntimeError(f"Network error fetching {url}: {exc}") from exc
+
+        if response.status_code == 200:
+            response.encoding = "utf-8"
+            html = response.text
+            cache_path.write_text(html, encoding="utf-8")
+            if not quiet:
+                print(f"FETCH     | {cache_path.name} ({len(html.encode('utf-8'))} bytes)")
+            return html, False
+
+        if response.status_code in (403, 404):
+            raise RuntimeError(f"HTTP {response.status_code} (not retrying) for {url}")
+
+        if 500 <= response.status_code < 600:
+            last_error = RuntimeError(f"HTTP {response.status_code} server error for {url}")
+            continue
+
+        raise RuntimeError(f"Unexpected HTTP {response.status_code} for {url}")
+
+    raise last_error or RuntimeError(f"Failed to fetch {url}")
 
 
-def discover_books(start_url: str, max_pages: int = 3) -> list[dict]:
+def discover_books(start_url: str, max_pages: int = 3) -> tuple[list[dict], int, int]:
+    """Return (discovered_links, pages_fetched_live, cache_hits)."""
     current_url = start_url
     pages_visited = 0
+    pages_fetched = 0
+    cache_hits = 0
     discovered: list[dict] = []
     seen_urls: set[str] = set()
 
     while current_url and pages_visited < max_pages:
         pages_visited += 1
-        html, _ = fetch_page(
+        html, from_cache = fetch_page(
             current_url,
             CACHE_DIR / f"catalogue-page-{pages_visited}.html",
             use_delay=(pages_visited > 1),
         )
-        soup = BeautifulSoup(html, "html.parser")
+        if from_cache:
+            cache_hits += 1
+        else:
+            pages_fetched += 1
 
+        soup = BeautifulSoup(html, "html.parser")
         for article in soup.select("article.product_pod"):
             link_tag = article.select_one("h3 a")
             if not link_tag or not link_tag.get("href"):
@@ -111,7 +137,7 @@ def discover_books(start_url: str, max_pages: int = 3) -> list[dict]:
         f"discovered={len(discovered)}, "
         f"unique_urls={len(seen_urls)}"
     )
-    return discovered
+    return discovered, pages_fetched, cache_hits
 
 
 def slug_from_book_url(product_url: str) -> str:
@@ -166,33 +192,74 @@ def normalize_and_validate(raw_record: dict) -> BookRecord:
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Polite scraper for Books to Scrape (first 3 pages).")
+    parser.add_argument(
+        "--test-broken-url",
+        action="store_true",
+        help="Inject one non-existent book URL to verify fault tolerance.",
+    )
+    args = parser.parse_args()
+
+    started_at = datetime.now(timezone.utc)
+    start_perf = time.perf_counter()
+
     start_url = "https://books.toscrape.com/catalogue/page-1.html"
-    book_links = discover_books(start_url, max_pages=3)
+    book_links, pages_fetched, cache_hits = discover_books(start_url, max_pages=3)
+
+    if args.test_broken_url:
+        book_links.append(
+            {
+                "product_url": "https://books.toscrape.com/catalogue/this-book-does-not-exist_999999/index.html",
+                "source_page": start_url,
+            }
+        )
 
     valid_by_url: dict[str, dict] = {}
     errors: list[dict] = []
+    failed_pages: list[dict] = []
 
     for item in book_links:
-        cache_file = BOOKS_CACHE_DIR / slug_from_book_url(item["product_url"])
-        html, _ = fetch_page(
-            item["product_url"],
-            cache_file,
-            use_delay=True,
-            quiet=True,
-        )
-        raw = extract_book_record(html, item["product_url"], item["source_page"])
+        url = item["product_url"]
+        cache_file = BOOKS_CACHE_DIR / slug_from_book_url(url)
         try:
+            html, from_cache = fetch_page(url, cache_file, use_delay=True, quiet=True)
+            if from_cache:
+                cache_hits += 1
+            else:
+                pages_fetched += 1
+        except Exception as exc:
+            print(f"WARN | Skipping failed page {url}: {exc}")
+            failed_pages.append({"url": url, "reason": str(exc)})
+            continue
+
+        try:
+            raw = extract_book_record(html, url, item["source_page"])
             validated = normalize_and_validate(raw)
             valid_by_url[validated.product_url] = validated.model_dump()
         except (ValidationError, ValueError) as exc:
-            errors.append({"product_url": item["product_url"], "reason": str(exc), "raw": raw})
+            errors.append({"product_url": url, "reason": str(exc)})
+
+    duration_seconds = round(time.perf_counter() - start_perf, 3)
 
     books_path = OUTPUT_DIR / "books.json"
     errors_path = OUTPUT_DIR / "errors.json"
+    report_path = OUTPUT_DIR / "run-report.json"
+
     books_path.write_text(json.dumps(list(valid_by_url.values()), indent=2, ensure_ascii=False), encoding="utf-8")
     errors_path.write_text(json.dumps(errors, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    print(f"valid_records={len(valid_by_url)}, invalid_records={len(errors)}")
+    report = {
+        "started_at": started_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "duration_seconds": duration_seconds,
+        "pages_fetched": pages_fetched,
+        "cache_hits": cache_hits,
+        "valid_records": len(valid_by_url),
+        "invalid_records": len(errors),
+        "failed_pages": len(failed_pages),
+        "failed_page_details": failed_pages,
+    }
+    report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(json.dumps(report, indent=2))
 
 
 if __name__ == "__main__":
