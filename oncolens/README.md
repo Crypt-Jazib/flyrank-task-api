@@ -1,50 +1,14 @@
-# OncoLens React + FastAPI
+@'
+# OncoLens — Containerized Gene-Expression Classification Capstone
 
-React frontend and FastAPI backend for the existing gene-expression Random Forest classifier. The saved model, feature list, metrics and supplied visualisations are carried over unchanged from the Streamlit version.
+**OncoLens** is a full-stack bioinformatics prototype that classifies multi-sample gene-expression CSV datasets across five cancer categories (`BRCA`, `COAD`, `KIRC`, `LUAD`, `PRAD`) using a trained 20,531-feature Random Forest classifier, wrapped in a containerized FastAPI + React architecture.
 
-## Requirements
-- Python 3.11+ for the backend
-- Node.js 20+ and npm for the frontend
-- Docker Desktop (optional, for the production-like combined run)
+> **Research Disclaimer:** Research prototype only. Outputs are experimental, not clinically validated, and must not be used for clinical diagnosis or treatment decisions.
 
-## Run locally (two terminals)
-
-### 1. Backend
-```powershell
-cd backend
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
-python -m uvicorn main:app --reload --host 127.0.0.1 --port 8000
-```
-API docs: http://127.0.0.1:8000/docs
-
-### 2. Frontend
-Open a second terminal:
-```powershell
-cd frontend
-npm install
-npm run dev
-```
-Open the Vite URL, normally http://localhost:5173.
-
-## Run both with Docker
-From the project root:
-```powershell
-docker compose up --build
-```
-Open http://localhost. Stop with `Ctrl+C`, then optionally run `docker compose down`.
-
-## Deploy on Vultr
-1. Create a Vultr Ubuntu VPS with Docker Engine and the Docker Compose plugin installed.
-2. Copy this project folder to the VPS.
-3. From the project root, run `docker compose up -d --build`.
-4. Allow inbound TCP port 80 in the Vultr firewall. Add HTTPS with a domain and a reverse proxy/TLS certificate before public production use.
-
-## API
-- `GET /api/health`
-- `GET /api/metadata`
-- `POST /api/predict` with multipart form field `file` containing a CSV.
-
-## Important
-OncoLens is an experimental research and educational prototype. It is not clinically validated and must not be used for diagnosis or treatment decisions. Model confidence scores are not clinical probabilities. Validate data provenance, split methodology, potential leakage and external performance before making model-performance claims.
+## Implemented Capstone Concepts (6/5 Required)
+1. **REST API Endpoints (`FastAPI`):** `GET /api/health`, `GET /api/metadata`, `POST /api/auth/login`, `POST /api/predict` (up to 200 MB CSV uploads), `GET /api/history`, and `GET /api/runs/{run_id}/report.pdf`.
+2. **Relational Database (`SQLite`):** Persists every analysis run (`filename`, `file_hash`, `samples_analysed`, `class_distribution`, `results_json`, `created_by`, `created_at`) in `oncolens.db`.
+3. **Authentication (`HTTPBearer` Token Auth):** Protects prediction, history, and PDF reporting routes behind Bearer token authentication with a one-click **Researcher Sign In** flow in the UI.
+4. **Content-Addressable Caching (`SHA-256`):** Hashes every uploaded CSV dataset; identical datasets return cached predictions from SQLite immediately without re-running Random Forest inference.
+5. **Automated PDF Reporting (`fpdf2`):** Generates downloadable multi-section bioinformatics summary PDF reports per analysis run.
+6. **Containerized Deployment (`Docker Compose`):** Multi-container orchestration (`oncolens-backend` + Nginx-served `oncolens-frontend`) booting with a single command.
